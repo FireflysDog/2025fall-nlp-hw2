@@ -263,7 +263,7 @@ def test_loop(model, loader, tgt_vocab, device, beam_size=1):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--num_train', type=int, default=-1)
-    parser.add_argument('--max_len', type=int, default=20)
+    parser.add_argument('--max_len', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_epoch', type=int, default=20)
     parser.add_argument('--lr', type=float, default=5e-4)
@@ -319,7 +319,7 @@ if __name__ == '__main__':
 
     model.load_state_dict(torch.load("model_transformer_best.pt"))
     hyps, refs, bleu = test_loop(model, testloader, en_vocab, device)
-    print(f"Test bleu (Beam Search, size={args.beam_size}) = {bleu:.2f}")
+    print(f"Test bleu = {bleu:f}")
     print(f"Ref: {refs[0]}")
     print(f"Hyp: {hyps[0]}")
     print(f"Training time: {round((time.time() - start_time)/60, 2)}min")
