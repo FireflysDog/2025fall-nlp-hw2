@@ -199,14 +199,19 @@ class DecoderRNN(nn.Module):
         return output, (h, c)
 
 class Seq2Seq(nn.Module):
-    def __init__(self, src_vocab, tgt_vocab, embedding_dim, hidden_size, max_len):
+    def __init__(self, src_vocab, tgt_vocab, embedding_dim, hidden_size, max_len,
+                 src_pad_id, tgt_pad_id, dropout=0.0, teacher_forcing_ratio=1.0, beam_size=1):
         super(Seq2Seq, self).__init__()
         self.src_vocab = src_vocab
         self.tgt_vocab = tgt_vocab
         self.hidden_size = hidden_size
-        self.encoder = EncoderRNN(len(src_vocab), embedding_dim, hidden_size)
-        self.decoder = DecoderRNN(len(tgt_vocab), embedding_dim, hidden_size)
+        self.encoder = EncoderRNN(len(src_vocab), embedding_dim, hidden_size, dropout)
+        self.decoder = DecoderRNN(len(tgt_vocab), embedding_dim, hidden_size, dropout)
         self.max_len = max_len
+        self.src_pad_id = src_pad_id
+        self.tgt_pad_id = tgt_pad_id
+        self.teacher_forcing_ratio = teacher_forcing_ratio
+        self.default_beam_size = beam_size
         
     def init_hidden(self, batch_size):
         """
@@ -216,6 +221,9 @@ class Seq2Seq(nn.Module):
         h = torch.zeros(batch_size, self.hidden_size).to(device)
         c = torch.zeros(batch_size, self.hidden_size).to(device)
         return (h, c)
+
+    def set_teacher_forcing_ratio(self, ratio: float):
+        self.teacher_forcing_ratio = max(0.0, min(1.0, ratio))
     
     def init_tgt_bos(self, batch_size):
         """
@@ -238,22 +246,27 @@ class Seq2Seq(nn.Module):
             state = self.encoder(input, state)
             encoder_hiddens.append(state[0]) # Store h
         encoder_hiddens = torch.stack(encoder_hiddens, dim=1)
-        return state, encoder_hiddens
+        mask = (src == self.src_pad_id)
+        return state, encoder_hiddens, mask
     
-    def forward_decoder(self, tgt, state, encoder_hiddens):
+    def forward_decoder(self, tgt, state, encoder_hiddens, mask):
         """
-        tgt: N
+        tgt: [N, L]
         state: (h, c)
-        encoder_hiddens: N * L * H
-        
-        解码器前向传播，用于训练，使用teacher forcing
+        encoder_hiddens: [N, L, H]
+        mask: [N, L]，True 表示 PAD
+        解码器前向传播，结合 teacher forcing
         """
         Bs, Lt = tgt.size()
         outputs = []
-        for i in range(Lt):
-            input = tgt[:, i]    # teacher forcing
-            output, state = self.decoder(input, state, encoder_hiddens)
+        input_token = tgt[:, 0]
+        hidden_state = state
+        for i in range(1, Lt):
+            output, hidden_state = self.decoder(input_token, hidden_state, encoder_hiddens, mask)
             outputs.append(output)
+            teacher_force = torch.rand(1).item() < self.teacher_forcing_ratio
+            next_input = tgt[:, i] if teacher_force else output.argmax(-1)
+            input_token = next_input
         outputs = torch.stack(outputs, dim=1)
         return outputs
         
@@ -263,25 +276,62 @@ class Seq2Seq(nn.Module):
         训练时前向传播。
         输入: src: [N, Ls], tgt: [N, Lt]
         """
-        state, encoder_hiddens = self.forward_encoder(src)
-        outputs = self.forward_decoder(tgt, state, encoder_hiddens)
+        state, encoder_hiddens, mask = self.forward_encoder(src)
+        outputs = self.forward_decoder(tgt, state, encoder_hiddens, mask)
         return outputs
     
-    def predict(self, src):
+    def predict(self, src, beam_size=None):
         """
         预测接口，输入 src: [N, Ls]
         """
-        state, encoder_hiddens = self.forward_encoder(src)
-        input = self.init_tgt_bos(batch_size=src.shape[0])
-        preds = [input]
-        while len(preds) < self.max_len:
-            output, state = self.decoder(input, state, encoder_hiddens)
-            input = output.argmax(-1)
-            preds.append(input)
-            if input == self.tgt_vocab.index("[EOS]"):
+        state, encoder_hiddens, mask = self.forward_encoder(src)
+        beam_size = beam_size or self.default_beam_size
+        if beam_size <= 1:
+            input = self.init_tgt_bos(batch_size=src.shape[0])
+            preds = [input]
+            hidden_state = state
+            eos_id = self.tgt_vocab.index("[EOS]")
+            while len(preds) < self.max_len:
+                output, hidden_state = self.decoder(input, hidden_state, encoder_hiddens, mask)
+                input = output.argmax(-1)
+                preds.append(input)
+                if (input == eos_id).all():
+                    break
+            preds = torch.stack(preds, dim=-1)
+            return preds
+
+        # Beam search仅支持batch=1
+        device = src.device
+        start_token = self.tgt_vocab.index("[BOS]")
+        end_token = self.tgt_vocab.index("[EOS]")
+        h, c = state
+        beams = [(0.0, [start_token], (h.clone(), c.clone()))]
+        finished = []
+        for _ in range(self.max_len - 1):
+            new_beams = []
+            for score, seq, st in beams:
+                h_state, c_state = st
+                last_token = torch.tensor([seq[-1]], device=device)
+                output, new_state = self.decoder(last_token, (h_state, c_state), encoder_hiddens, mask)
+                log_probs = output.squeeze(0)
+                topk = torch.topk(log_probs, beam_size)
+                for next_score, token_id in zip(topk.values.tolist(), topk.indices.tolist()):
+                    new_seq = seq + [token_id]
+                    total_score = score + next_score
+                    if token_id == end_token:
+                        finished.append((total_score, new_seq))
+                    else:
+                        new_h, new_c = new_state
+                        new_beams.append((total_score, new_seq, (new_h.clone(), new_c.clone())))
+            beams = sorted(new_beams, key=lambda x: x[0], reverse=True)[:beam_size]
+            if not beams:
                 break
-        preds = torch.stack(preds, dim=-1)
-        return preds
+        if not finished and beams:
+            finished = [(score, seq) for score, seq, _ in beams]
+        if not finished:
+            finished = [(0.0, [start_token])]
+        best_seq = max(finished, key=lambda x: x[0])[1]
+        return torch.tensor(best_seq, device=device).unsqueeze(0)
     
 
 # 构建Dataloader
@@ -297,11 +347,17 @@ def padding(inp_ids, max_len, pad_id):
     ids_[:max_len] = inp_ids
     return ids_
 
-def create_dataloader(zh_sents, en_sents, max_len, batch_size, pad_id):
+def create_dataloader(zh_sents, en_sents, max_len, batch_size, src_pad_id, tgt_pad_id):
     dataloaders = {}
     for split in ['train', 'val', 'test']:
         shuffle = True if split=='train' else False
-        datas = [(padding(zh_vocab.encode(zh, max_len), max_len, pad_id), padding(en_vocab.encode(en, max_len), max_len, pad_id)) for zh, en in zip(zh_sents[split], en_sents[split])]
+        datas = [
+            (
+                padding(zh_vocab.encode(zh, max_len), max_len, src_pad_id),
+                padding(en_vocab.encode(en, max_len), max_len, tgt_pad_id)
+            )
+            for zh, en in zip(zh_sents[split], en_sents[split])
+        ]
         dataloaders[split] = torch.utils.data.DataLoader(datas, batch_size=batch_size, shuffle=shuffle, collate_fn=collate)
     return dataloaders['train'], dataloaders['val'], dataloaders['test']
 
@@ -312,10 +368,9 @@ def train_loop(model, optimizer, criterion, loader, device):
     for src, tgt in tqdm(loader):
         src = src.to(device)
         tgt = tgt.to(device)
-        outputs = model(src, tgt)
-        loss = criterion(outputs[:,:-1,:].reshape(-1, outputs.shape[-1]), tgt[:,1:].reshape(-1))
-
         optimizer.zero_grad()
+        outputs = model(src, tgt)
+        loss = criterion(outputs.reshape(-1, outputs.shape[-1]), tgt[:,1:].reshape(-1))
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1)     # 裁剪梯度，将梯度范数裁剪为1，使训练更稳定
         optimizer.step()
@@ -346,12 +401,17 @@ def test_loop(model, loader, tgt_vocab, device):
 # 主函数
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()      
-    parser.add_argument('--num_train', default=-1, help="训练集大小，等于-1时将包含全部训练数据")
-    parser.add_argument('--max_len', default=10, help="句子最大长度")
-    parser.add_argument('--batch_size', default=128)
+    parser.add_argument('--num_train', type=int, default=-1, help="训练集大小，等于-1时将包含全部训练数据")
+    parser.add_argument('--max_len', type=int, default=20, help="句子最大长度")
+    parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--optim', default='adam')
-    parser.add_argument('--num_epoch', default=10)
-    parser.add_argument('--lr', default=0.0005)
+    parser.add_argument('--num_epoch', type=int, default=20)
+    parser.add_argument('--lr', type=float, default=0.002)
+    parser.add_argument('--dropout', type=float, default=0.05)
+    parser.add_argument('--teacher_forcing_start', type=float, default=0.95)
+    parser.add_argument('--teacher_forcing_end', type=float, default=0.5)
+    parser.add_argument('--teacher_forcing_decay_epochs', type=int, default=25)
+    parser.add_argument('--beam_size', type=int, default=4)
     args = parser.parse_args()
 
     zh_sents, en_sents = load_data(args.num_train)
@@ -364,11 +424,31 @@ if __name__ == '__main__':
     print("中文词表大小为", len(zh_vocab))
     print("英语词表大小为", len(en_vocab))
 
-    trainloader, validloader, testloader = create_dataloader(zh_sents, en_sents, args.max_len, args.batch_size, pad_id=zh_vocab.word2idx['[PAD]'])
+    src_pad_id = zh_vocab.word2idx['[PAD]']
+    tgt_pad_id = en_vocab.word2idx['[PAD]']
+    trainloader, validloader, testloader = create_dataloader(
+        zh_sents,
+        en_sents,
+        args.max_len,
+        args.batch_size,
+        src_pad_id=src_pad_id,
+        tgt_pad_id=tgt_pad_id,
+    )
 
     torch.manual_seed(1)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = Seq2Seq(zh_vocab, en_vocab, embedding_dim=256, hidden_size=256, max_len=args.max_len)
+    model = Seq2Seq(
+        zh_vocab,
+        en_vocab,
+        embedding_dim=256,
+        hidden_size=256,
+        max_len=args.max_len,
+        src_pad_id=src_pad_id,
+        tgt_pad_id=tgt_pad_id,
+        dropout=args.dropout,
+        teacher_forcing_ratio=args.teacher_forcing_start,
+        beam_size=args.beam_size,
+    )
     model.to(device)
     if args.optim=='sgd':
         optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
@@ -381,14 +461,24 @@ if __name__ == '__main__':
     # 训练
     start_time = time.time()
     best_score = 0.0
-    for _ in range(args.num_epoch):
+    if args.teacher_forcing_decay_epochs <= 0:
+        decay_step = 0.0
+    else:
+        decay_step = (args.teacher_forcing_start - args.teacher_forcing_end) / max(1, args.teacher_forcing_decay_epochs - 1)
+
+    for epoch_idx in range(args.num_epoch):
+        current_ratio = max(
+            args.teacher_forcing_end,
+            args.teacher_forcing_start - decay_step * epoch_idx,
+        )
+        model.set_teacher_forcing_ratio(current_ratio)
         loss = train_loop(model, optimizer, criterion, trainloader, device)
         hypotheses, references, bleu_score = test_loop(model, validloader, en_vocab, device)
         # 保存验证集上bleu最高的checkpoint
         if bleu_score > best_score:
             torch.save(model.state_dict(), "model_best.pt")
             best_score = bleu_score
-        print(f"Epoch {_}: loss = {loss}, valid bleu = {bleu_score}")
+        print(f"Epoch {epoch_idx}: loss = {loss}, valid bleu = {bleu_score}, teacher forcing = {current_ratio:.3f}")
         print(references[0])
         print(hypotheses[0])
     end_time = time.time()
