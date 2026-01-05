@@ -124,6 +124,13 @@ class EncoderRNN(nn.Module):
         
         输出更新后的隐状态hidden（大小为N * H）
         """
+        """
+        参数:
+        - input: [N]
+        - hidden: [N, H]
+        返回:
+        - 更新后的隐状态 hidden (N, H)
+        """
         embedding = self.dropout(self.embed(input))
         hidden = self.rnn(embedding, hidden)
         return hidden
@@ -142,6 +149,9 @@ class Attention(nn.Module):
         
         # Project encoder outputs
         # energy: [batch_size, seq_len, hidden_size]
+        # 计算注意力分数: [batch, seq_len]
+        # hidden.unsqueeze(2): [batch, hidden, 1]
+        # 使用 mask 屏蔽 PAD
         energy = self.attn(encoder_outputs) 
         
         # Calculate scores: [batch_size, seq_len]
@@ -176,6 +186,15 @@ class DecoderRNN(nn.Module):
         hidden: N * H
         encoder_outputs: N * L * H
         """
+        """
+        参数:
+        - input: [N] 当前时间步输入 token id
+        - hidden: [N, H] 当前隐状态
+        - encoder_outputs: [N, L, H] 编码器所有时间步隐状态
+        返回:
+        - output: [N, V] log-probabilities
+        - hidden: 更新后的隐状态 [N, H]
+        """
         embedding = self.input_dropout(self.embed(input)) # [N, Emb]
         
         # Calculate attention weights with mask
@@ -198,17 +217,22 @@ class DecoderRNN(nn.Module):
         return output, hidden
 
 class Seq2Seq(nn.Module):
-    def __init__(self, src_vocab, tgt_vocab, embedding_dim, hidden_size, max_len, pad_id, dropout=0.0, teacher_forcing_ratio=1.0):
+    def __init__(self, src_vocab, tgt_vocab, embedding_dim, hidden_size, max_len, pad_id,
+                 dropout=0.0, teacher_forcing_ratio=1.0, beam_size=1):
         super(Seq2Seq, self).__init__()
         self.src_vocab = src_vocab
         self.tgt_vocab = tgt_vocab
         self.hidden_size = hidden_size
         self.pad_id = pad_id
         self.teacher_forcing_ratio = teacher_forcing_ratio
+        self.default_beam_size = beam_size
         self.encoder = EncoderRNN(len(src_vocab), embedding_dim, hidden_size, dropout)
         self.decoder = DecoderRNN(len(tgt_vocab), embedding_dim, hidden_size, dropout)
         self.max_len = max_len
         
+    def set_teacher_forcing_ratio(self, ratio: float):
+        self.teacher_forcing_ratio = max(0.0, min(1.0, ratio))
+
     def init_hidden(self, batch_size):
         """
         初始化编码器端隐状态为全0向量（大小为1 * H）
@@ -227,6 +251,14 @@ class Seq2Seq(nn.Module):
         """
         src: N * L
         编码器前向传播，输出最终隐状态hidden (N * H)和隐状态序列encoder_hiddens (N * L * H)
+        """
+        """
+        输入:
+        - src: [N, L]
+        返回:
+        - hidden: 最终隐状态 [N, H]
+        - encoder_hiddens: 每个时间步隐状态 [N, L, H]
+        - mask: 填充掩码 [N, L]（True 表示 PAD）
         """
         Bs, Ls = src.size()
         hidden = self.init_hidden(batch_size=Bs)
@@ -252,6 +284,14 @@ class Seq2Seq(nn.Module):
         
         解码器前向传播，结合teacher forcing比率进行训练，输出预测结果outputs，大小为N * (L-1) * V，其中V为目标语言词表大小
         """
+        """
+        参数:
+        - tgt: [N, L] 目标序列（含 BOS/EOS）
+        - hidden: [N, H] 编码器最后隐状态（用于初始化解码器）
+        - encoder_hiddens: [N, L, H]
+        - mask: [N, L] 填充掩码
+        根据 teacher forcing 比率进行逐步解码并返回所有时间步的预测 logits: [N, L-1, V]
+        """
         Bs, Lt = tgt.size()
         outputs = []
         input_token = tgt[:, 0]
@@ -272,29 +312,73 @@ class Seq2Seq(nn.Module):
             
             训练时的前向传播
         """
+        """
+        训练时前向传播。
+        输入:
+        - src: [N, Ls]
+        - tgt: [N, Lt]
+        返回:
+        - outputs: [N, Lt-1, V]
+        """
         hidden, encoder_hiddens, mask = self.forward_encoder(src)
         outputs = self.forward_decoder(tgt, hidden, encoder_hiddens, mask)
         return outputs
     
-    def predict(self, src):
+    def predict(self, src, beam_size=None):
         """
             src: 1 * Ls
             
-            用于预测，解码器端初始输入为[BOS]，之后每个位置的输入为上个时间片预测概率最大的单词
-            当解码长度超过self.max_len或预测出了[EOS]时解码终止
-            输出预测的单词编号序列，大小为1 * L，L为预测长度
+            使用束搜索（默认束宽 self.default_beam_size）或贪心进行预测
+        """
+        """
+        预测接口。
+        输入:
+        - src: [N, Ls]
+        可选使用束搜索（beam_size>1），否则使用贪心解码。
+        返回预测的 token id 序列。
         """
         hidden, encoder_hiddens, mask = self.forward_encoder(src)
-        input = self.init_tgt_bos(batch_size=src.shape[0])
-        preds = [input]
-        while len(preds) < self.max_len:
-            output, hidden = self.decoder(input, hidden, encoder_hiddens, mask)
-            input = output.argmax(-1)
-            preds.append(input)
-            if input == self.tgt_vocab.index("[EOS]"):
+        beam_size = beam_size or self.default_beam_size
+        if beam_size <= 1:
+            input = self.init_tgt_bos(batch_size=src.shape[0])
+            preds = [input]
+            while len(preds) < self.max_len:
+                output, hidden = self.decoder(input, hidden, encoder_hiddens, mask)
+                input = output.argmax(-1)
+                preds.append(input)
+                if input == self.tgt_vocab.index("[EOS]"):
+                    break
+            preds = torch.stack(preds, dim=-1)
+            return preds
+
+        # Beam search assumes batch size 1
+        device = src.device
+        start_token = self.tgt_vocab.index("[BOS]")
+        end_token = self.tgt_vocab.index("[EOS]")
+
+        beams = [(0.0, [start_token], hidden)]
+        finished = []
+        for _ in range(self.max_len - 1):
+            new_beams = []
+            for score, seq, h in beams:
+                last_token = torch.tensor([seq[-1]], device=device)
+                output, new_hidden = self.decoder(last_token, h, encoder_hiddens, mask)
+                log_probs = output.squeeze(0)
+                topk = torch.topk(log_probs, beam_size)
+                for next_score, token_id in zip(topk.values.tolist(), topk.indices.tolist()):
+                    new_seq = seq + [token_id]
+                    total_score = score + next_score
+                    if token_id == end_token:
+                        finished.append((total_score, new_seq))
+                    else:
+                        new_beams.append((total_score, new_seq, new_hidden.clone()))
+            beams = sorted(new_beams, key=lambda x: x[0], reverse=True)[:beam_size]
+            if not beams:
                 break
-        preds = torch.stack(preds, dim=-1)
-        return preds
+        if not finished and beams:
+            finished = [(score, seq) for score, seq, _ in beams]
+        best_seq = max(finished, key=lambda x: x[0])[1]
+        return torch.tensor(best_seq, device=device).unsqueeze(0)
     
 
 # 构建Dataloader
@@ -372,7 +456,10 @@ if __name__ == '__main__':
     parser.add_argument('--num_epoch', type=int, default=20)
     parser.add_argument('--lr', type=float, default=0.001)
     parser.add_argument('--dropout', type=float, default=0.1)
-    parser.add_argument('--teacher_forcing_ratio', type=float, default=0.9)
+    parser.add_argument('--teacher_forcing_start', type=float, default=0.95)
+    parser.add_argument('--teacher_forcing_end', type=float, default=0.5)
+    parser.add_argument('--teacher_forcing_decay_epochs', type=int, default=25)
+    parser.add_argument('--beam_size', type=int, default=4)
     args = parser.parse_args()
 
     zh_sents, en_sents = load_data(args.num_train)
@@ -391,7 +478,17 @@ if __name__ == '__main__':
 
     torch.manual_seed(1)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = Seq2Seq(zh_vocab, en_vocab, embedding_dim=256, hidden_size=256, max_len=args.max_len, pad_id=src_pad_id, dropout=args.dropout, teacher_forcing_ratio=args.teacher_forcing_ratio)
+    model = Seq2Seq(
+        zh_vocab,
+        en_vocab,
+        embedding_dim=256,
+        hidden_size=256,
+        max_len=args.max_len,
+        pad_id=src_pad_id,
+        dropout=args.dropout,
+        teacher_forcing_ratio=args.teacher_forcing_start,
+        beam_size=args.beam_size,
+    )
     model.to(device)
     if args.optim=='sgd':
         optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
@@ -404,14 +501,24 @@ if __name__ == '__main__':
     # 训练
     start_time = time.time()
     best_score = 0.0
-    for _ in range(args.num_epoch):
+    if args.teacher_forcing_decay_epochs <= 0:
+        decay_step = 0.0
+    else:
+        decay_step = (args.teacher_forcing_start - args.teacher_forcing_end) / max(1, args.teacher_forcing_decay_epochs - 1)
+
+    for epoch_idx in range(args.num_epoch):
+        current_ratio = max(
+            args.teacher_forcing_end,
+            args.teacher_forcing_start - decay_step * epoch_idx,
+        )
+        model.set_teacher_forcing_ratio(current_ratio)
         loss = train_loop(model, optimizer, criterion, trainloader, device)
         hypotheses, references, bleu_score = test_loop(model, validloader, en_vocab, device)
         # 保存验证集上bleu最高的checkpoint
         if bleu_score > best_score:
             torch.save(model.state_dict(), "model_rnn_att_best.pt")
             best_score = bleu_score
-        print(f"Epoch {_}: loss = {loss}, valid bleu = {bleu_score}")
+        print(f"Epoch {epoch_idx}: loss = {loss}, valid bleu = {bleu_score}, teacher forcing = {current_ratio:.3f}")
         print(references[0])
         print(hypotheses[0])
     end_time = time.time()
